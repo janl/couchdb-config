@@ -44,6 +44,10 @@
 
 -define(TIMEOUT, 30000).
 
+-define(INVALID_SECTION, <<"Invalid configuration section">>).
+-define(INVALID_KEY, <<"Invalid configuration key">>).
+-define(INVALID_VALUE, <<"Invalid configuration value">>).
+
 -record(config, {
     notify_funs=[],
     ini_files=undefined,
@@ -232,20 +236,25 @@ handle_call(all, _From, Config) ->
     Resp = lists:sort((ets:tab2list(?MODULE))),
     {reply, Resp, Config};
 handle_call({set, Sec, Key, Val, Persist, Reason}, _From, Config) ->
-    true = ets:insert(?MODULE, {{Sec, Key}, Val}),
-    couch_log:notice("~p: [~s] ~s set to ~s for reason ~p",
-        [?MODULE, Sec, Key, Val, Reason]),
-    case {Persist, Config#config.write_filename} of
-        {true, undefined} ->
-            ok;
-        {true, FileName} ->
-            config_writer:save_to_file({{Sec, Key}, Val}, FileName);
-        _ ->
-            ok
-    end,
-    Event = {config_change, Sec, Key, Val, Persist},
-    gen_event:sync_notify(config_event, Event),
-    {reply, ok, Config};
+    case validate_config_update(Sec, Key, Val) of
+        {error, ValidationError} ->
+            {reply, {error, ValidationError}, Config};
+        ok ->
+            true = ets:insert(?MODULE, {{Sec, Key}, Val}),
+            couch_log:notice("~p: [~s] ~s set to ~s for reason ~p",
+                [?MODULE, Sec, Key, Val, Reason]),
+            case {Persist, Config#config.write_filename} of
+                {true, undefined} ->
+                    ok;
+                {true, FileName} ->
+                    config_writer:save_to_file({{Sec, Key}, Val}, FileName);
+                _ ->
+                    ok
+            end,
+            Event = {config_change, Sec, Key, Val, Persist},
+            gen_event:sync_notify(config_event, Event),
+            {reply, ok, Config}
+    end;
 handle_call({delete, Sec, Key, Persist, Reason}, _From, Config) ->
     true = ets:delete(?MODULE, {Sec,Key}),
     couch_log:notice("~p: [~s] ~s deleted for reason ~p",
@@ -380,6 +389,15 @@ debug_config() ->
             ok
     end.
 
+validate_config_update(Sec, Key, Val) ->
+    {ok, RE} = re:compile("^[[:print:]]+$"),
+    case {re:run(Sec, RE), re:run(Key, RE), re:run(Val, RE)} of
+        {{match, _}, {match, _}, {match, _}} -> ok;
+        {nomatch, _, _} -> {error, ?INVALID_SECTION};
+        {_, nomatch, _} -> {error, ?INVALID_KEY};
+        {_, _, nomatch} -> {error, ?INVALID_VALUE}
+    end.
+
 -ifdef(TEST).
 -include_lib("eunit/include/eunit.hrl").
 
@@ -399,6 +417,33 @@ to_float_test() ->
     ?assertEqual(-1.1, to_float("-01.1")),
     ?assertEqual(0.0, to_float("-0.0")),
     ?assertEqual(0.0, to_float("+0.0")),
+    ok.
+
+validation_test() ->
+    ?assertEqual(ok, validate_config_update("section", "key", "value")),
+    ?assertEqual(ok, validate_config_update("section\n", "key\n", "value\n")),
+    ?assertEqual({error, ?INVALID_SECTION},
+        validate_config_update("section\n\n", "key", "value")),
+    ?assertEqual({error, ?INVALID_KEY},
+        validate_config_update("section", "key\n\n", "value\n\n")),
+    ?assertEqual({error, ?INVALID_SECTION},
+        validate_config_update("section\r", "key", "value")),
+    ?assertEqual({error, ?INVALID_KEY},
+        validate_config_update("section", "key\r", "value")),
+    ?assertEqual({error,?INVALID_VALUE},
+        validate_config_update("section", "key", "value\r")),
+    ?assertEqual({error, ?INVALID_SECTION},
+        validate_config_update("section\r\r", "key", "value")),
+    ?assertEqual({error, ?INVALID_KEY},
+        validate_config_update("section", "key\r\r", "value")),
+    ?assertEqual({error,?INVALID_VALUE},
+        validate_config_update("section", "key", "value\r\r")),
+    ?assertEqual({error, ?INVALID_SECTION},
+        validate_config_update("section\r\n", "key", "value")),
+    ?assertEqual({error, ?INVALID_KEY},
+        validate_config_update("section", "key\r\n", "value")),
+    ?assertEqual({error,?INVALID_VALUE},
+        validate_config_update("section", "key", "value\r\n")),
     ok.
 
 -endif.
